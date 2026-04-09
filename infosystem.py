@@ -2,12 +2,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 import re
+import os
 
-DB_FILE = "student_directory.db"
-
-# ---------------------------------------------------------------------------
-# Database layer
-# ---------------------------------------------------------------------------
+DB_FILE = os.path.join(os.path.dirname(__file__), "student_directory.db")
 
 def get_conn():
     conn = sqlite3.connect(DB_FILE)
