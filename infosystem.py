@@ -7,151 +7,207 @@ import os
 DB_FILE = os.path.join(os.path.dirname(__file__), "student_directory.db")
 
 def get_conn():
-    conn = sqlite3.connect(DB_FILE)
+    # isolation_level=None = autocommit; write functions issue BEGIN/COMMIT explicitly
+    conn = sqlite3.connect(DB_FILE, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA foreign_keys = OFF")  # cascades managed manually
     return conn
 
+def _exec_write(statements):
+    """Run a list of (sql, params) tuples in a single transaction."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        for sql, params in statements:
+            conn.execute(sql, params)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+def _exec_read(sql, params=()):
+    conn = get_conn()
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+def _exec_read_one(sql, params=()):
+    conn = get_conn()
+    try:
+        return conn.execute(sql, params).fetchone()
+    finally:
+        conn.close()
+
 def init_db():
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS colleges (
                 college_code TEXT PRIMARY KEY,
                 name         TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS programs (
                 prog_code    TEXT PRIMARY KEY,
                 name         TEXT NOT NULL,
-                college_code TEXT,
-                FOREIGN KEY (college_code) REFERENCES colleges (college_code)
-                    ON UPDATE CASCADE ON DELETE SET NULL
+                college_code TEXT
             );
-
             CREATE TABLE IF NOT EXISTS students (
                 id        TEXT PRIMARY KEY,
                 firstname TEXT NOT NULL,
                 lastname  TEXT NOT NULL,
                 prog_code TEXT,
                 year      TEXT NOT NULL,
-                gender    TEXT NOT NULL,
-                FOREIGN KEY (prog_code) REFERENCES programs (prog_code)
-                    ON UPDATE CASCADE ON DELETE SET NULL
+                gender    TEXT NOT NULL
             );
         """)
+    finally:
+        conn.close()
+    _migrate_schema()
+
+def _migrate_schema():
+    """Drop NOT NULL on prog_code/college_code if the old schema is present."""
+    def needs_migration(table, col):
+        rows = _exec_read(f"PRAGMA table_info({table})")
+        for r in rows:
+            if r["name"] == col and r["notnull"] == 1:
+                return True
+        return False
+
+    if needs_migration("programs", "college_code"):
+        conn = get_conn()
+        try:
+            conn.executescript("""
+                BEGIN;
+                CREATE TABLE IF NOT EXISTS programs_new (
+                    prog_code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    college_code TEXT
+                );
+                INSERT INTO programs_new SELECT prog_code, name, college_code FROM programs;
+                DROP TABLE programs;
+                ALTER TABLE programs_new RENAME TO programs;
+                COMMIT;
+            """)
+        finally:
+            conn.close()
+
+    if needs_migration("students", "prog_code"):
+        conn = get_conn()
+        try:
+            conn.executescript("""
+                BEGIN;
+                CREATE TABLE IF NOT EXISTS students_new (
+                    id TEXT PRIMARY KEY,
+                    firstname TEXT NOT NULL,
+                    lastname TEXT NOT NULL,
+                    prog_code TEXT,
+                    year TEXT NOT NULL,
+                    gender TEXT NOT NULL
+                );
+                INSERT INTO students_new SELECT id, firstname, lastname, prog_code, year, gender FROM students;
+                DROP TABLE students;
+                ALTER TABLE students_new RENAME TO students;
+                COMMIT;
+            """)
+        finally:
+            conn.close()
 
 init_db()
 
 # -- Colleges ----------------------------------------------------------------
 
 def db_get_colleges(search=""):
-    with get_conn() as conn:
-        if search:
-            q = f"%{search}%"
-            return conn.execute(
-                "SELECT college_code, name FROM colleges "
-                "WHERE college_code LIKE ? OR name LIKE ? ORDER BY name",
-                (q, q)
-            ).fetchall()
-        return conn.execute(
-            "SELECT college_code, name FROM colleges ORDER BY name"
-        ).fetchall()
+    if search:
+        q = f"%{search}%"
+        return _exec_read(
+            "SELECT college_code, name FROM colleges "
+            "WHERE college_code LIKE ? OR name LIKE ? ORDER BY name", (q, q))
+    return _exec_read("SELECT college_code, name FROM colleges ORDER BY name")
 
 def db_add_college(code, name):
-    with get_conn() as conn:
-        conn.execute("INSERT INTO colleges (college_code, name) VALUES (?, ?)", (code, name))
+    _exec_write([("INSERT INTO colleges (college_code, name) VALUES (?, ?)", (code, name))])
 
 def db_update_college(old_code, new_code, new_name):
-    with get_conn() as conn:
-        conn.execute("UPDATE programs SET college_code=? WHERE college_code=?", (new_code, old_code))
-        conn.execute("UPDATE colleges SET college_code=?, name=? WHERE college_code=?",
-                     (new_code, new_name, old_code))
+    _exec_write([
+        ("UPDATE programs SET college_code=? WHERE college_code=?", (new_code, old_code)),
+        ("UPDATE colleges SET college_code=?, name=? WHERE college_code=?", (new_code, new_name, old_code)),
+    ])
 
 def db_delete_colleges(codes):
-    with get_conn() as conn:
-        for c in codes:
-            conn.execute("UPDATE programs SET college_code=NULL WHERE college_code=?", (c,))
-            conn.execute("DELETE FROM colleges WHERE college_code=?", (c,))
+    """Delete colleges; programs that belonged to them get college_code = NULL."""
+    stmts = []
+    for c in codes:
+        stmts.append(("UPDATE programs SET college_code=NULL WHERE college_code=?", (c,)))
+        stmts.append(("DELETE FROM colleges WHERE college_code=?", (c,)))
+    _exec_write(stmts)
 
 def db_college_code_exists(code, exclude_code=None):
-    with get_conn() as conn:
-        if exclude_code:
-            return conn.execute(
-                "SELECT 1 FROM colleges WHERE college_code=? AND college_code!=?",
-                (code, exclude_code)
-            ).fetchone() is not None
-        return conn.execute(
-            "SELECT 1 FROM colleges WHERE college_code=?", (code,)
-        ).fetchone() is not None
+    if exclude_code:
+        return _exec_read_one(
+            "SELECT 1 FROM colleges WHERE college_code=? AND college_code!=?",
+            (code, exclude_code)) is not None
+    return _exec_read_one(
+        "SELECT 1 FROM colleges WHERE college_code=?", (code,)) is not None
 
 # -- Programs ----------------------------------------------------------------
 
 def db_get_programs(search=""):
-    with get_conn() as conn:
-        if search:
-            q = f"%{search}%"
-            return conn.execute(
-                "SELECT p.prog_code, p.name, COALESCE(c.name,'N/A') AS college_name "
-                "FROM programs p LEFT JOIN colleges c USING (college_code) "
-                "WHERE p.prog_code LIKE ? OR p.name LIKE ? OR c.name LIKE ? ORDER BY p.name",
-                (q, q, q)
-            ).fetchall()
-        return conn.execute(
+    if search:
+        q = f"%{search}%"
+        return _exec_read(
             "SELECT p.prog_code, p.name, COALESCE(c.name,'N/A') AS college_name "
-            "FROM programs p LEFT JOIN colleges c USING (college_code) ORDER BY p.name"
-        ).fetchall()
+            "FROM programs p LEFT JOIN colleges c USING (college_code) "
+            "WHERE p.prog_code LIKE ? OR p.name LIKE ? OR c.name LIKE ? ORDER BY p.name",
+            (q, q, q))
+    return _exec_read(
+        "SELECT p.prog_code, p.name, COALESCE(c.name,'N/A') AS college_name "
+        "FROM programs p LEFT JOIN colleges c USING (college_code) ORDER BY p.name")
 
 def db_get_all_program_names():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT name FROM programs ORDER BY name").fetchall()
-        return [r["name"] for r in rows]
+    rows = _exec_read("SELECT name FROM programs ORDER BY name")
+    return [r["name"] for r in rows]
 
 def db_add_program(code, name, college_code):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO programs (prog_code, name, college_code) VALUES (?, ?, ?)",
-            (code, name, college_code if college_code else None)
-        )
+    _exec_write([("INSERT INTO programs (prog_code, name, college_code) VALUES (?, ?, ?)",
+                  (code, name, college_code if college_code else None))])
 
 def db_update_program(old_code, new_code, new_name, new_college_code):
-    with get_conn() as conn:
-        conn.execute("UPDATE students SET prog_code=? WHERE prog_code=?", (new_code, old_code))
-        conn.execute(
-            "UPDATE programs SET prog_code=?, name=?, college_code=? WHERE prog_code=?",
-            (new_code, new_name, new_college_code if new_college_code else None, old_code)
-        )
+    _exec_write([
+        ("UPDATE students SET prog_code=? WHERE prog_code=?", (new_code, old_code)),
+        ("UPDATE programs SET prog_code=?, name=?, college_code=? WHERE prog_code=?",
+         (new_code, new_name, new_college_code if new_college_code else None, old_code)),
+    ])
 
 def db_delete_programs(codes):
-    with get_conn() as conn:
-        for c in codes:
-            conn.execute("UPDATE students SET prog_code=NULL WHERE prog_code=?", (c,))
-            conn.execute("DELETE FROM programs WHERE prog_code=?", (c,))
+    """Delete programs; enrolled students get prog_code = NULL (Not Enrolled)."""
+    stmts = []
+    for c in codes:
+        stmts.append(("UPDATE students SET prog_code=NULL WHERE prog_code=?", (c,)))
+        stmts.append(("DELETE FROM programs WHERE prog_code=?", (c,)))
+    _exec_write(stmts)
 
 def db_prog_code_exists(code, exclude_code=None):
-    with get_conn() as conn:
-        if exclude_code:
-            return conn.execute(
-                "SELECT 1 FROM programs WHERE prog_code=? AND prog_code!=?",
-                (code, exclude_code)
-            ).fetchone() is not None
-        return conn.execute(
-            "SELECT 1 FROM programs WHERE prog_code=?", (code,)
-        ).fetchone() is not None
+    if exclude_code:
+        return _exec_read_one(
+            "SELECT 1 FROM programs WHERE prog_code=? AND prog_code!=?",
+            (code, exclude_code)) is not None
+    return _exec_read_one(
+        "SELECT 1 FROM programs WHERE prog_code=?", (code,)) is not None
 
 def db_prog_code_from_name(name):
-    with get_conn() as conn:
-        row = conn.execute("SELECT prog_code FROM programs WHERE name=?", (name,)).fetchone()
-        return row["prog_code"] if row else ""
+    row = _exec_read_one("SELECT prog_code FROM programs WHERE name=?", (name,))
+    return row["prog_code"] if row else ""
 
 def db_get_all_college_options():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT college_code, name FROM colleges ORDER BY name").fetchall()
-        return [f"{r['college_code']} - {r['name']}" for r in rows]
+    rows = _exec_read("SELECT college_code, name FROM colleges ORDER BY name")
+    return [f"{r['college_code']} - {r['name']}" for r in rows]
 
 def db_get_all_college_names():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT name FROM colleges ORDER BY name").fetchall()
-        return [r["name"] for r in rows]
+    rows = _exec_read("SELECT name FROM colleges ORDER BY name")
+    return [r["name"] for r in rows]
 
 # -- Students ----------------------------------------------------------------
 
@@ -159,7 +215,8 @@ def db_get_students(search="", filters=None):
     filters = filters or {}
     base = (
         "SELECT s.id, s.lastname || ', ' || s.firstname AS name, "
-        "s.gender, s.year, COALESCE(p.name,'N/A') AS program, COALESCE(c.name,'N/A') AS college "
+        "s.gender, s.year, COALESCE(p.name,'Not Enrolled') AS program, "
+        "COALESCE(c.name,'N/A') AS college "
         "FROM students s "
         "LEFT JOIN programs p ON s.prog_code = p.prog_code "
         "LEFT JOIN colleges c ON p.college_code = c.college_code"
@@ -180,38 +237,27 @@ def db_get_students(search="", filters=None):
     if conditions:
         base += " WHERE " + " AND ".join(conditions)
     base += " ORDER BY s.lastname, s.firstname"
-    with get_conn() as conn:
-        return conn.execute(base, params).fetchall()
+    return _exec_read(base, params)
 
 def db_get_student_by_id(student_id):
-    with get_conn() as conn:
-        return conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+    return _exec_read_one("SELECT * FROM students WHERE id=?", (student_id,))
 
 def db_add_student(sid, firstname, lastname, prog_code, year, gender):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO students (id, firstname, lastname, prog_code, year, gender) VALUES (?,?,?,?,?,?)",
-            (sid, firstname, lastname, prog_code if prog_code else None, year, gender)
-        )
+    _exec_write([("INSERT INTO students (id, firstname, lastname, prog_code, year, gender) VALUES (?,?,?,?,?,?)",
+                  (sid, firstname, lastname, prog_code if prog_code else None, year, gender))])
 
 def db_update_student(old_sid, new_sid, firstname, lastname, prog_code, year, gender):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE students SET id=?,firstname=?,lastname=?,prog_code=?,year=?,gender=? WHERE id=?",
-            (new_sid, firstname, lastname, prog_code if prog_code else None, year, gender, old_sid)
-        )
+    _exec_write([("UPDATE students SET id=?,firstname=?,lastname=?,prog_code=?,year=?,gender=? WHERE id=?",
+                  (new_sid, firstname, lastname, prog_code if prog_code else None, year, gender, old_sid))])
 
 def db_delete_students(ids):
-    with get_conn() as conn:
-        conn.executemany("DELETE FROM students WHERE id=?", [(i,) for i in ids])
+    _exec_write([("DELETE FROM students WHERE id=?", (i,)) for i in ids])
 
 def db_student_id_exists(sid, exclude_sid=None):
-    with get_conn() as conn:
-        if exclude_sid:
-            return conn.execute(
-                "SELECT 1 FROM students WHERE id=? AND id!=?", (sid, exclude_sid)
-            ).fetchone() is not None
-        return conn.execute("SELECT 1 FROM students WHERE id=?", (sid,)).fetchone() is not None
+    if exclude_sid:
+        return _exec_read_one(
+            "SELECT 1 FROM students WHERE id=? AND id!=?", (sid, exclude_sid)) is not None
+    return _exec_read_one("SELECT 1 FROM students WHERE id=?", (sid,)) is not None
 
 # ---------------------------------------------------------------------------
 # GUI
@@ -231,7 +277,6 @@ class StudentDirectoryApp(tk.Tk):
         self.add_popup_win = None
         self.edit_popup_win = None
 
-        # Auto-refresh: track DB file mtime
         self._last_mtime = self._get_db_mtime()
 
         self.sidebar = tk.Frame(self, bg="#d2b48c", width=180)
@@ -404,7 +449,6 @@ class StudentDirectoryApp(tk.Tk):
         if self.edit_mode:
             tk.Button(ctrls, text="Delete Selected", bg="#ff4d4d", fg="white",
                       command=lambda: self.delete_selected(section_type)).pack(side="left", padx=2)
-            # Edit button for all three sections
             edit_cmd = {
                 "Students": self.edit_selected_student,
                 "Programs": self.edit_selected_program,
@@ -504,7 +548,6 @@ class StudentDirectoryApp(tk.Tk):
             ln_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
             ln_ent.pack(fill="x", pady=5, ipady=3)
 
-            # "Not Enrolled" = NULL prog_code
             prog_names = ["Not Enrolled"] + db_get_all_program_names()
             prog_sel, _ = self.create_popup_dropdown(container, "Program", prog_names)
             year_sel, _ = self.create_popup_dropdown(container, "Year Level", ["1", "2", "3", "4", "5"])
@@ -527,13 +570,10 @@ class StudentDirectoryApp(tk.Tk):
                 if not all([firstname, lastname, prog_name, year, gender]):
                     messagebox.showwarning("!", "Fill all fields.")
                     return
-                if prog_name == "Not Enrolled":
-                    prog_code = None
-                else:
-                    prog_code = db_prog_code_from_name(prog_name)
-                    if not prog_code:
-                        messagebox.showerror("Error", "Invalid program selected.")
-                        return
+                prog_code = None if prog_name == "Not Enrolled" else db_prog_code_from_name(prog_name)
+                if prog_name != "Not Enrolled" and not prog_code:
+                    messagebox.showerror("Error", "Invalid program selected.")
+                    return
                 db_add_student(raw_id, firstname, lastname, prog_code, year, gender)
                 self._last_mtime = self._get_db_mtime()
                 self.show_students()
@@ -549,7 +589,6 @@ class StudentDirectoryApp(tk.Tk):
             tk.Label(container, text="Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
             n_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
             n_ent.pack(fill="x", pady=5, ipady=3)
-            # "N/A" = NULL college_code
             coll_opts = ["N/A"] + db_get_all_college_options()
             coll_sel, _ = self.create_popup_dropdown(container, "College", coll_opts)
 
@@ -563,10 +602,7 @@ class StudentDirectoryApp(tk.Tk):
                 if db_prog_code_exists(code):
                     messagebox.showerror("Error", f"Program code '{code}' already exists.")
                     return
-                if coll_val == "N/A":
-                    college_code = None
-                else:
-                    college_code = coll_val.split(" - ")[0] if " - " in coll_val else None
+                college_code = None if coll_val == "N/A" else (coll_val.split(" - ")[0] if " - " in coll_val else None)
                 db_add_program(code, name, college_code)
                 self._last_mtime = self._get_db_mtime()
                 self.show_programs()
@@ -642,7 +678,6 @@ class StudentDirectoryApp(tk.Tk):
         container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
         container.pack(fill="both", expand=True)
 
-        # Editable ID (with duplicate detection)
         tk.Label(container, text="ID Number", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
         id_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
         id_ent.pack(fill="x", pady=(5, 0), ipady=3)
@@ -661,10 +696,7 @@ class StudentDirectoryApp(tk.Tk):
         ln_ent.insert(0, student_data["lastname"])
 
         prog_names = ["Not Enrolled"] + db_get_all_program_names()
-        with get_conn() as conn:
-            prog_row = conn.execute(
-                "SELECT name FROM programs WHERE prog_code=?", (student_data["prog_code"],)
-            ).fetchone()
+        prog_row = _exec_read_one("SELECT name FROM programs WHERE prog_code=?", (student_data["prog_code"],))
         current_prog_name = prog_row["name"] if prog_row else "Not Enrolled"
 
         prog_sel, _ = self.create_popup_dropdown(container, "Program", prog_names,
@@ -696,13 +728,10 @@ class StudentDirectoryApp(tk.Tk):
             if not all([new_firstname, new_lastname, new_gender, new_year, new_prog_name]):
                 messagebox.showwarning("Warning", "Please fill all fields.")
                 return
-            if new_prog_name == "Not Enrolled":
-                new_prog_code = None
-            else:
-                new_prog_code = db_prog_code_from_name(new_prog_name)
-                if not new_prog_code:
-                    messagebox.showerror("Error", "Invalid program selected.")
-                    return
+            new_prog_code = None if new_prog_name == "Not Enrolled" else db_prog_code_from_name(new_prog_name)
+            if new_prog_name != "Not Enrolled" and not new_prog_code:
+                messagebox.showerror("Error", "Invalid program selected.")
+                return
             db_update_student(student_data["id"], new_id, new_firstname, new_lastname,
                               new_prog_code, new_year, new_gender)
             self._last_mtime = self._get_db_mtime()
@@ -725,12 +754,10 @@ class StudentDirectoryApp(tk.Tk):
         if not item:
             return
         prog_code = self.tree.item(item, "values")[1]
-        with get_conn() as conn:
-            prog_data = conn.execute(
-                "SELECT p.prog_code, p.name, p.college_code, COALESCE(c.name,'') AS college_name "
-                "FROM programs p LEFT JOIN colleges c USING(college_code) WHERE p.prog_code=?",
-                (prog_code,)
-            ).fetchone()
+        prog_data = _exec_read_one(
+            "SELECT p.prog_code, p.name, p.college_code, COALESCE(c.name,'') AS college_name "
+            "FROM programs p LEFT JOIN colleges c USING(college_code) WHERE p.prog_code=?",
+            (prog_code,))
         if not prog_data:
             messagebox.showerror("Error", "Program data not found.")
             return
@@ -750,7 +777,6 @@ class StudentDirectoryApp(tk.Tk):
         container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
         container.pack(fill="both", expand=True)
 
-        # Editable program code
         tk.Label(container, text="Program Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
         code_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
         code_ent.pack(fill="x", pady=(5, 0), ipady=3)
@@ -769,8 +795,7 @@ class StudentDirectoryApp(tk.Tk):
                 if opt.startswith(prog_data["college_code"] + " - "):
                     current_coll = opt
                     break
-        coll_sel, _ = self.create_popup_dropdown(container, "College", coll_opts,
-                                                   default_value=current_coll)
+        coll_sel, _ = self.create_popup_dropdown(container, "College", coll_opts, default_value=current_coll)
 
         btn_frame = tk.Frame(container, bg="white")
         btn_frame.pack(pady=20)
@@ -809,11 +834,8 @@ class StudentDirectoryApp(tk.Tk):
         if not item:
             return
         college_code = self.tree.item(item, "values")[1]
-        with get_conn() as conn:
-            coll_data = conn.execute(
-                "SELECT college_code, name FROM colleges WHERE college_code=?",
-                (college_code,)
-            ).fetchone()
+        coll_data = _exec_read_one(
+            "SELECT college_code, name FROM colleges WHERE college_code=?", (college_code,))
         if not coll_data:
             messagebox.showerror("Error", "College data not found.")
             return
@@ -833,7 +855,6 @@ class StudentDirectoryApp(tk.Tk):
         container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
         container.pack(fill="both", expand=True)
 
-        # Editable college code
         tk.Label(container, text="College Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
         code_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
         code_ent.pack(fill="x", pady=(5, 0), ipady=3)
@@ -999,14 +1020,10 @@ class StudentDirectoryApp(tk.Tk):
             db_delete_students(selected_keys)
 
         elif section == "Programs":
-            # Warn about cascading unenrollment
-            affected = 0
-            with get_conn() as conn:
-                for k in selected_keys:
-                    row = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM students WHERE prog_code=?", (k,)
-                    ).fetchone()
-                    affected += row["cnt"]
+            affected = sum(
+                _exec_read_one("SELECT COUNT(*) AS cnt FROM students WHERE prog_code=?", (k,))["cnt"]
+                for k in selected_keys
+            )
             msg = f"Delete {len(selected_keys)} program(s)?"
             if affected:
                 msg += f"\n\n⚠ {affected} enrolled student(s) will be set to 'Not Enrolled'."
@@ -1015,14 +1032,10 @@ class StudentDirectoryApp(tk.Tk):
             db_delete_programs(selected_keys)
 
         elif section == "Colleges":
-            # Warn about cascading program unlink
-            affected_progs = 0
-            with get_conn() as conn:
-                for k in selected_keys:
-                    row = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM programs WHERE college_code=?", (k,)
-                    ).fetchone()
-                    affected_progs += row["cnt"]
+            affected_progs = sum(
+                _exec_read_one("SELECT COUNT(*) AS cnt FROM programs WHERE college_code=?", (k,))["cnt"]
+                for k in selected_keys
+            )
             msg = f"Delete {len(selected_keys)} college(s)?"
             if affected_progs:
                 msg += f"\n\n⚠ {affected_progs} program(s) will be unlinked (college → N/A)."
