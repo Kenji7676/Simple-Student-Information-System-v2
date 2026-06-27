@@ -7,14 +7,12 @@ import os
 DB_FILE = os.path.join(os.path.dirname(__file__), "student_directory.db")
 
 def get_conn():
-    # isolation_level=None = autocommit; write functions issue BEGIN/COMMIT explicitly
     conn = sqlite3.connect(DB_FILE, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = OFF")  # cascades managed manually
+    conn.execute("PRAGMA foreign_keys = OFF")
     return conn
 
 def _exec_write(statements):
-    """Run a list of (sql, params) tuples in a single transaction."""
     conn = get_conn()
     try:
         conn.execute("BEGIN")
@@ -68,7 +66,6 @@ def init_db():
     _migrate_schema()
 
 def _migrate_schema():
-    """Drop NOT NULL on prog_code/college_code if the old schema is present."""
     def needs_migration(table, col):
         rows = _exec_read(f"PRAGMA table_info({table})")
         for r in rows:
@@ -137,7 +134,6 @@ def db_update_college(old_code, new_code, new_name):
     ])
 
 def db_delete_colleges(codes):
-    """Delete colleges; programs that belonged to them get college_code = NULL."""
     stmts = []
     for c in codes:
         stmts.append(("UPDATE programs SET college_code=NULL WHERE college_code=?", (c,)))
@@ -158,12 +154,12 @@ def db_get_programs(search=""):
     if search:
         q = f"%{search}%"
         return _exec_read(
-            "SELECT p.prog_code, p.name, COALESCE(c.name,'N/A') AS college_name "
+            "SELECT p.prog_code, p.name, COALESCE(p.college_code, 'N/A') AS college_code, COALESCE(c.name,'N/A') AS college_name "
             "FROM programs p LEFT JOIN colleges c USING (college_code) "
             "WHERE p.prog_code LIKE ? OR p.name LIKE ? OR c.name LIKE ? ORDER BY p.name",
             (q, q, q))
     return _exec_read(
-        "SELECT p.prog_code, p.name, COALESCE(c.name,'N/A') AS college_name "
+        "SELECT p.prog_code, p.name, COALESCE(p.college_code, 'N/A') AS college_code, COALESCE(c.name,'N/A') AS college_name "
         "FROM programs p LEFT JOIN colleges c USING (college_code) ORDER BY p.name")
 
 def db_get_all_program_names():
@@ -182,7 +178,6 @@ def db_update_program(old_code, new_code, new_name, new_college_code):
     ])
 
 def db_delete_programs(codes):
-    """Delete programs; enrolled students get prog_code = NULL (Not Enrolled)."""
     stmts = []
     for c in codes:
         stmts.append(("UPDATE students SET prog_code=NULL WHERE prog_code=?", (c,)))
@@ -215,8 +210,8 @@ def db_get_students(search="", filters=None):
     filters = filters or {}
     base = (
         "SELECT s.id, s.lastname || ', ' || s.firstname AS name, "
-        "s.gender, s.year, COALESCE(p.name,'Not Enrolled') AS program, "
-        "COALESCE(c.name,'N/A') AS college "
+        "s.gender, s.year, COALESCE(s.prog_code, 'N/A') AS prog_code, COALESCE(p.name,'Not Enrolled') AS program, "
+        "COALESCE(p.college_code, 'N/A') AS college_code, COALESCE(c.name,'N/A') AS college "
         "FROM students s "
         "LEFT JOIN programs p ON s.prog_code = p.prog_code "
         "LEFT JOIN colleges c ON p.college_code = c.college_code"
@@ -226,9 +221,9 @@ def db_get_students(search="", filters=None):
         q = f"%{search}%"
         conditions.append(
             "(s.id LIKE ? OR s.firstname LIKE ? OR s.lastname LIKE ? "
-            "OR s.gender LIKE ? OR s.year LIKE ? OR p.name LIKE ? OR c.name LIKE ?)"
+            "OR s.gender LIKE ? OR s.year LIKE ? OR s.prog_code LIKE ? OR p.name LIKE ? OR p.college_code LIKE ? OR c.name LIKE ?)"
         )
-        params.extend([q, q, q, q, q, q, q])
+        params.extend([q, q, q, q, q, q, q, q, q])
     for key, col in [("gender","s.gender"),("year","s.year"),("program","p.name"),("college","c.name")]:
         if filters.get(key):
             ph = ",".join("?" * len(filters[key]))
@@ -260,6 +255,42 @@ def db_student_id_exists(sid, exclude_sid=None):
     return _exec_read_one("SELECT 1 FROM students WHERE id=?", (sid,)) is not None
 
 # ---------------------------------------------------------------------------
+# Design tokens
+# ---------------------------------------------------------------------------
+
+C = {
+    "bg_app":       "#0f1117",   
+    "bg_sidebar":   "#161b27",   
+    "bg_card":      "#1e2433",   
+    "bg_input":     "#252b3b",   
+    "bg_row_alt":   "#1a1f2e",   
+    "bg_hover":     "#2a3147",   
+
+    "accent":       "#6366f1",   
+    "accent_hover": "#818cf8",   
+    "accent_muted": "#312e81",   
+
+    "danger":       "#ef4444",   
+    "danger_hover": "#f87171",   
+    "success":      "#22c55e",   
+
+    "text_primary":   "#f1f5f9", 
+    "text_secondary": "#94a3b8", 
+    "text_muted":     "#475569", 
+
+    "border":       "#2d3448",   
+    "border_focus": "#6366f1",   
+
+    "white":        "#ffffff",
+    "sidebar_active": "#6366f1",
+}
+
+FONT_FAMILY = "Segoe UI"
+
+def _font(size=11, weight="normal"):
+    return (FONT_FAMILY, size, weight)
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -267,7 +298,7 @@ class StudentDirectoryApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Student Directory System")
-        self.configure(bg="#f5f5dc")
+        self.configure(bg=C["bg_app"])
 
         self.edit_mode = False
         self.search_var = tk.StringVar()
@@ -279,40 +310,189 @@ class StudentDirectoryApp(tk.Tk):
 
         self._last_mtime = self._get_db_mtime()
 
-        self.sidebar = tk.Frame(self, bg="#d2b48c", width=180)
-        self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
-        self.active_section = tk.StringVar(value="Students")
-        for section in ["Students", "Programs", "Colleges"]:
-            tk.Radiobutton(
-                self.sidebar, text=section, variable=self.active_section, value=section,
-                indicatoron=0, width=15, padx=10, pady=10, bg="#d2b48c", fg="white",
-                selectcolor="#8b4513", font=("Arial", 12),
-                command=lambda s=section: self.reset_all_and_switch(s)
-            ).pack(pady=5)
-
-        self.content_frame = tk.Frame(self, bg="white")
-        self.content_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
-
-        self.button_container = tk.Frame(self, bg="#f5f5dc")
-        self.button_container.place(relx=0.98, rely=0.95, anchor="se")
-        tk.Button(
-            self.button_container, text="+", font=("Arial", 18, "bold"),
-            bg="#8b4513", fg="white", command=self.add_entry_popup, bd=0, width=2
-        ).pack(side="left", padx=5)
-        self.edit_btn = tk.Button(
-            self.button_container, text="📝", font=("Arial", 18),
-            bg="#d2b48c", fg="white", command=self.toggle_edit_mode, bd=0, width=2
-        )
-        self.edit_btn.pack(side="left")
+        self._build_styles()
+        self._build_layout()
 
         self.bind_all("<Button-1>", self.check_filter_focus)
-        self.center_window(1150, 600)
+        self.center_window(1250, 660)
         self.switch_section("Students")
         self._start_auto_refresh()
 
-    # ------------------------------------------------------------------
-    # Auto-refresh (mtime on .db file)
-    # ------------------------------------------------------------------
+    def _build_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure("Modern.Treeview",
+            background=C["bg_card"],
+            foreground=C["text_primary"],
+            fieldbackground=C["bg_card"],
+            rowheight=36,
+            borderwidth=0,
+            font=_font(10),
+        )
+        style.configure("Modern.Treeview.Heading",
+            background=C["bg_sidebar"],
+            foreground=C["text_secondary"],
+            font=_font(9, "bold"),
+            relief="flat",
+            borderwidth=0,
+            padding=(12, 8),
+        )
+        style.map("Modern.Treeview",
+            background=[("selected", C["accent_muted"])],
+            foreground=[("selected", C["text_primary"])],
+        )
+        style.map("Modern.Treeview.Heading",
+            background=[("active", C["bg_hover"])],
+        )
+
+        style.configure("Modern.Vertical.TScrollbar",
+            troughcolor=C["bg_card"],
+            background=C["border"],
+            borderwidth=0,
+            arrowsize=0,
+            width=6,
+        )
+        style.map("Modern.Vertical.TScrollbar",
+            background=[("active", C["text_muted"])],
+        )
+
+    def _build_layout(self):
+        self.sidebar = tk.Frame(self, bg=C["bg_sidebar"], width=210)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+
+        brand_frame = tk.Frame(self.sidebar, bg=C["bg_sidebar"])
+        brand_frame.pack(fill="x", padx=20, pady=(28, 24))
+
+        tk.Label(brand_frame, text="📚", font=("Segoe UI Emoji", 22),
+                 bg=C["bg_sidebar"], fg=C["accent"]).pack(side="left", padx=(0, 10))
+
+        title_stack = tk.Frame(brand_frame, bg=C["bg_sidebar"])
+        title_stack.pack(side="left")
+        tk.Label(title_stack, text="Student", font=_font(13, "bold"),
+                 bg=C["bg_sidebar"], fg=C["text_primary"]).pack(anchor="w")
+        tk.Label(title_stack, text="Directory System", font=_font(8),
+                 bg=C["bg_sidebar"], fg=C["text_muted"]).pack(anchor="w")
+
+        tk.Frame(self.sidebar, bg=C["border"], height=1).pack(fill="x", padx=16, pady=(0, 16))
+
+        tk.Label(self.sidebar, text="NAVIGATION", font=_font(7, "bold"),
+                 bg=C["bg_sidebar"], fg=C["text_muted"]).pack(anchor="w", padx=20, pady=(0, 8))
+
+        self.active_section = tk.StringVar(value="Students")
+        self._nav_buttons = {}
+        nav_icons = {"Students": "👤", "Programs": "🎓", "Colleges": "🏛"}
+        for section in ["Students", "Programs", "Colleges"]:
+            btn = self._make_nav_button(section, nav_icons[section])
+            self._nav_buttons[section] = btn
+
+        tk.Frame(self.sidebar, bg=C["bg_sidebar"]).pack(fill="both", expand=True)
+        tk.Frame(self.sidebar, bg=C["border"], height=1).pack(fill="x", padx=16, pady=(0, 16))
+
+        self._add_btn = tk.Frame(self.sidebar, bg=C["accent"], cursor="hand2")
+        self._add_btn.pack(fill="x", padx=16, pady=(0, 8))
+        self._add_btn.bind("<Button-1>", lambda e: self.add_entry_popup())
+        self._add_btn.bind("<Enter>", lambda e: self._add_btn.config(bg=C["accent_hover"]))
+        self._add_btn.bind("<Leave>", lambda e: self._add_btn.config(bg=C["accent"]))
+
+        add_inner = tk.Frame(self._add_btn, bg=C["accent"])
+        add_inner.pack(padx=14, pady=10)
+        add_inner.bind("<Button-1>", lambda e: self.add_entry_popup())
+        add_inner.bind("<Enter>", lambda e: [self._add_btn.config(bg=C["accent_hover"]),
+                                              add_inner.config(bg=C["accent_hover"])])
+        add_inner.bind("<Leave>", lambda e: [self._add_btn.config(bg=C["accent"]),
+                                              add_inner.config(bg=C["accent"])])
+        add_lbl = tk.Label(add_inner, text="+ Add Entry", font=_font(10, "bold"),
+                 bg=C["accent"], fg=C["white"])
+        add_lbl.pack(side="left")
+        add_lbl.bind("<Button-1>", lambda e: self.add_entry_popup())
+        add_lbl.bind("<Enter>", lambda e: [self._add_btn.config(bg=C["accent_hover"]),
+                                            add_inner.config(bg=C["accent_hover"]),
+                                            add_lbl.config(bg=C["accent_hover"])])
+        add_lbl.bind("<Leave>", lambda e: [self._add_btn.config(bg=C["accent"]),
+                                            add_inner.config(bg=C["accent"]),
+                                            add_lbl.config(bg=C["accent"])])
+
+        self._edit_frame = tk.Frame(self.sidebar, bg=C["bg_card"], cursor="hand2")
+        self._edit_frame.pack(fill="x", padx=16, pady=(0, 20))
+        self._edit_frame.bind("<Button-1>", lambda e: self.toggle_edit_mode())
+        self._edit_frame.bind("<Enter>", lambda e: self._edit_frame.config(bg=C["bg_hover"]))
+        self._edit_frame.bind("<Leave>", lambda e: self._on_edit_btn_leave())
+
+        edit_inner = tk.Frame(self._edit_frame, bg=C["bg_card"])
+        edit_inner.pack(padx=14, pady=10)
+        edit_inner.bind("<Button-1>", lambda e: self.toggle_edit_mode())
+        edit_inner.bind("<Enter>", lambda e: [self._edit_frame.config(bg=C["bg_hover"]),
+                                               edit_inner.config(bg=C["bg_hover"])])
+        edit_inner.bind("<Leave>", lambda e: [self._on_edit_btn_leave(),
+                                               edit_inner.config(bg=self._edit_bg())])
+        self._edit_label = tk.Label(edit_inner, text="✏  Edit Mode", font=_font(10),
+                                     bg=C["bg_card"], fg=C["text_secondary"])
+        self._edit_label.pack(side="left")
+        self._edit_label.bind("<Button-1>", lambda e: self.toggle_edit_mode())
+
+        self.content_frame = tk.Frame(self, bg=C["bg_app"])
+        self.content_frame.pack(side="right", fill="both", expand=True)
+        self.content_frame.columnconfigure(0, weight=1)
+        self.content_frame.rowconfigure(1, weight=1)
+
+    def _edit_bg(self):
+        return C["accent_muted"] if self.edit_mode else C["bg_card"]
+
+    def _on_edit_btn_leave(self):
+        bg = self._edit_bg()
+        self._edit_frame.config(bg=bg)
+
+    def _make_nav_button(self, section, icon):
+        frame = tk.Frame(self.sidebar, bg=C["bg_sidebar"], cursor="hand2")
+        frame.pack(fill="x", padx=10, pady=2)
+
+        inner = tk.Frame(frame, bg=C["bg_sidebar"])
+        inner.pack(fill="x", padx=6, pady=1)
+
+        icon_lbl = tk.Label(inner, text=icon, font=("Segoe UI Emoji", 12),
+                             bg=C["bg_sidebar"], fg=C["text_secondary"], width=2)
+        icon_lbl.pack(side="left", padx=(8, 6), pady=8)
+
+        text_lbl = tk.Label(inner, text=section, font=_font(11),
+                             bg=C["bg_sidebar"], fg=C["text_secondary"], anchor="w")
+        text_lbl.pack(side="left", fill="x", expand=True, pady=8)
+
+        def on_click(e=None):
+            self.reset_all_and_switch(section)
+
+        def on_enter(e=None):
+            if self.active_section.get() != section:
+                for w in [frame, inner, icon_lbl, text_lbl]:
+                    w.config(bg=C["bg_hover"])
+
+        def on_leave(e=None):
+            if self.active_section.get() != section:
+                for w in [frame, inner, icon_lbl, text_lbl]:
+                    w.config(bg=C["bg_sidebar"])
+
+        for w in [frame, inner, icon_lbl, text_lbl]:
+            w.bind("<Button-1>", on_click)
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+
+        return {"frame": frame, "inner": inner, "icon": icon_lbl, "text": text_lbl}
+
+    def _update_nav_active(self, section):
+        for s, widgets in self._nav_buttons.items():
+            if s == section:
+                for w in [widgets["frame"], widgets["inner"]]:
+                    w.config(bg=C["accent_muted"])
+                widgets["icon"].config(bg=C["accent_muted"], fg=C["accent"])
+                widgets["text"].config(bg=C["accent_muted"], fg=C["text_primary"],
+                                       font=_font(11, "bold"))
+            else:
+                for w in [widgets["frame"], widgets["inner"]]:
+                    w.config(bg=C["bg_sidebar"])
+                widgets["icon"].config(bg=C["bg_sidebar"], fg=C["text_muted"])
+                widgets["text"].config(bg=C["bg_sidebar"], fg=C["text_secondary"],
+                                       font=_font(11))
 
     def _get_db_mtime(self):
         try:
@@ -329,24 +509,36 @@ class StudentDirectoryApp(tk.Tk):
             self.after(1500, poll)
         self.after(1500, poll)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def handle_empty_search(self, *args):
         if self.search_var.get() == "":
             self.switch_section(self.active_section.get())
 
     def toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode
-        self.edit_btn.config(bg="#8b4513" if self.edit_mode else "#d2b48c")
+        bg = self._edit_bg()
+        fg_label = C["accent"] if self.edit_mode else C["text_secondary"]
+        self._edit_frame.config(bg=bg)
+        self._edit_label.config(bg=bg, fg=fg_label)
+        for child in self._edit_frame.winfo_children():
+            child.config(bg=bg)
+            for c2 in child.winfo_children():
+                if c2 != self._edit_label:
+                    c2.config(bg=bg)
         self.switch_section(self.active_section.get())
 
     def reset_all_and_switch(self, section):
         self.search_var.set("")
         self.active_filters = {"gender": [], "year": [], "program": [], "college": []}
         self.edit_mode = False
-        self.edit_btn.config(bg="#d2b48c")
+        self.active_section.set(section)
+        bg = self._edit_bg()
+        self._edit_frame.config(bg=bg)
+        self._edit_label.config(bg=bg, fg=C["text_secondary"])
+        for child in self._edit_frame.winfo_children():
+            child.config(bg=bg)
+            for c2 in child.winfo_children():
+                if c2 != self._edit_label:
+                    c2.config(bg=bg)
         self.switch_section(section)
 
     def center_window(self, width, height):
@@ -359,18 +551,67 @@ class StudentDirectoryApp(tk.Tk):
         y = (self.winfo_screenheight() // 2) - (h // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _styled_entry(self, parent, **kwargs):
+        e = tk.Entry(parent,
+                     bg=C["bg_input"],
+                     fg=C["text_primary"],
+                     insertbackground=C["text_primary"],
+                     relief="flat",
+                     font=_font(10),
+                     bd=0,
+                     highlightthickness=1,
+                     highlightbackground=C["border"],
+                     highlightcolor=C["border_focus"],
+                     **kwargs)
+        return e
+
+    def _styled_button(self, parent, text, command, style="primary", **kwargs):
+        styles = {
+            "primary":  {"bg": C["accent"],  "fg": C["white"],        "abg": C["accent_hover"]},
+            "danger":   {"bg": C["danger"],  "fg": C["white"],        "abg": C["danger_hover"]},
+            "success":  {"bg": "#16a34a",    "fg": C["white"],        "abg": C["success"]},
+            "neutral":  {"bg": C["bg_card"], "fg": C["text_secondary"],"abg": C["bg_hover"]},
+            "ghost":    {"bg": C["bg_app"],  "fg": C["text_muted"],   "abg": C["bg_card"]},
+        }
+        s = styles.get(style, styles["primary"])
+        btn = tk.Button(parent,
+                        text=text,
+                        bg=s["bg"],
+                        fg=s["fg"],
+                        activebackground=s["abg"],
+                        activeforeground=s["fg"],
+                        font=_font(10, "bold"),
+                        relief="flat",
+                        bd=0,
+                        cursor="hand2",
+                        command=command,
+                        padx=16,
+                        pady=7,
+                        **kwargs)
+        return btn
+
+    def _field_label(self, parent, text):
+        tk.Label(parent, text=text, font=_font(9, "bold"),
+                 bg=C["bg_card"], fg=C["text_secondary"]).pack(anchor="w", pady=(12, 3))
+
     def create_popup_dropdown(self, parent, label, options, is_filter=False,
                                filter_key=None, refresh_callback=None, default_value=""):
-        frame = tk.Frame(parent, bg="white")
+        frame = tk.Frame(parent, bg=C["bg_card"])
         frame.pack(fill="x", pady=2)
-        tk.Label(frame, text=label, font=("Arial", 8, "bold"), bg="white", fg="#555").pack(anchor="w")
+
+        tk.Label(frame, text=label, font=_font(9, "bold"),
+                 bg=C["bg_card"], fg=C["text_secondary"]).pack(anchor="w", pady=(10, 3))
+
         var = tk.StringVar(value=default_value)
-        ent = tk.Entry(frame, textvariable=var, font=("Arial", 10), bg="#f4f4f4", bd=0)
-        ent.pack(fill="x", ipady=3)
-        drop_outer = tk.Frame(frame, bg="white", highlightbackground="#d2b48c", highlightthickness=1)
-        canvas = tk.Canvas(drop_outer, bg="white", height=100 if is_filter else 80, highlightthickness=0)
-        scrollbar = tk.Scrollbar(drop_outer, orient="vertical", command=canvas.yview)
-        drop_inner = tk.Frame(canvas, bg="white")
+        ent = self._styled_entry(frame, textvariable=var)
+        ent.pack(fill="x", ipady=5)
+
+        drop_outer = tk.Frame(frame, bg=C["border"], highlightthickness=0)
+        canvas = tk.Canvas(drop_outer, bg=C["bg_input"],
+                           height=100 if is_filter else 80, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(drop_outer, orient="vertical", command=canvas.yview,
+                                   style="Modern.Vertical.TScrollbar")
+        drop_inner = tk.Frame(canvas, bg=C["bg_input"])
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.create_window((0, 0), window=drop_inner, anchor="nw")
         selected_val = {"val": default_value}
@@ -387,15 +628,21 @@ class StudentDirectoryApp(tk.Tk):
                 (not is_filter or o not in self.pending_filters[filter_key])
             ]
             if matches:
-                drop_outer.pack(fill="x")
+                drop_outer.pack(fill="x", pady=(2, 0))
                 for i, m in enumerate(matches):
-                    bg_c = "#8b4513" if (i == 0 and query != "") else "white"
-                    fg_c = "white" if (i == 0 and query != "") else "black"
-                    tk.Button(
-                        drop_inner, text=m, anchor="w", bg=bg_c, fg=fg_c,
-                        relief="flat", font=("Arial", 8),
+                    is_first = (i == 0 and query != "")
+                    bg_c = C["accent_muted"] if is_first else C["bg_input"]
+                    fg_c = C["accent"] if is_first else C["text_primary"]
+                    item_btn = tk.Button(
+                        drop_inner, text=m, anchor="w",
+                        bg=bg_c, fg=fg_c,
+                        activebackground=C["bg_hover"],
+                        activeforeground=C["text_primary"],
+                        relief="flat", font=_font(9),
+                        padx=10, pady=5,
                         command=lambda v=m: select_action(v)
-                    ).pack(fill="x")
+                    )
+                    item_btn.pack(fill="x")
                 drop_inner.update_idletasks()
                 canvas.config(scrollregion=canvas.bbox("all"))
                 if len(matches) > 3:
@@ -421,132 +668,194 @@ class StudentDirectoryApp(tk.Tk):
         ent.bind("<Return>", lambda e: select_action(matches[0]) if matches else None)
         return selected_val, ent
 
-    # ------------------------------------------------------------------
-    # Section routing
-    # ------------------------------------------------------------------
-
     def switch_section(self, section):
+        self._update_nav_active(section)
         if section == "Students": self.show_students()
         elif section == "Programs": self.show_programs()
         elif section == "Colleges": self.show_colleges()
 
     # ------------------------------------------------------------------
+    # Sorting core engine
+    # ------------------------------------------------------------------
+    def sort_column(self, col, reverse):
+        data_list = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        
+        def natural_sort_key(s):
+            return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
+            
+        data_list.sort(key=lambda t: natural_sort_key(t[0]), reverse=reverse)
+        
+        for index, (val, k) in enumerate(data_list):
+            self.tree.move(k, "", index)
+            if self.tree.item(k, "values")[0] != "[X]":
+                tag = "odd" if index % 2 == 0 else "even"
+                self.tree.item(k, tags=(tag,))
+                
+        self.tree.heading(col, command=lambda _col=col: self.sort_column(_col, not reverse))
+
+    # ------------------------------------------------------------------
     # Table display
     # ------------------------------------------------------------------
-
     def display_table(self, columns, rows, section_type):
         for w in self.content_frame.winfo_children():
             w.destroy()
 
-        header = tk.Frame(self.content_frame, bg="white")
-        header.pack(fill="x", pady=10)
-        tk.Label(header, text=section_type, font=("Arial", 16, "bold"),
-                 bg="white", fg="#8b4513").pack(side="left", padx=10)
+        topbar = tk.Frame(self.content_frame, bg=C["bg_app"])
+        topbar.pack(fill="x", padx=28, pady=(24, 0))
 
-        ctrls = tk.Frame(header, bg="white")
-        ctrls.pack(side="right", padx=10)
+        title_group = tk.Frame(topbar, bg=C["bg_app"])
+        title_group.pack(side="left")
+        tk.Label(title_group, text=section_type, font=_font(20, "bold"),
+                 bg=C["bg_app"], fg=C["text_primary"]).pack(side="left")
+        count_lbl = tk.Label(title_group, text=f"  {len(rows)} records",
+                             font=_font(11), bg=C["bg_app"], fg=C["text_muted"])
+        count_lbl.pack(side="left", padx=(8, 0), pady=6)
+
+        ctrls = tk.Frame(topbar, bg=C["bg_app"])
+        ctrls.pack(side="right")
 
         if self.edit_mode:
-            tk.Button(ctrls, text="Delete Selected", bg="#ff4d4d", fg="white",
-                      command=lambda: self.delete_selected(section_type)).pack(side="left", padx=2)
+            self._styled_button(ctrls, "🗑  Delete Selected", style="danger",
+                                 command=lambda: self.delete_selected(section_type)).pack(side="left", padx=4)
             edit_cmd = {
                 "Students": self.edit_selected_student,
                 "Programs": self.edit_selected_program,
                 "Colleges": self.edit_selected_college,
             }.get(section_type)
             if edit_cmd:
-                tk.Button(ctrls, text="Edit Selected", bg="#4CAF50", fg="white",
-                          command=edit_cmd).pack(side="left", padx=2)
-            tk.Button(ctrls, text="Cancel", bg="gray", fg="white",
-                      command=self.toggle_edit_mode).pack(side="left", padx=2)
+                self._styled_button(ctrls, "✎  Edit Selected", style="success",
+                                     command=edit_cmd).pack(side="left", padx=4)
+            self._styled_button(ctrls, "✕  Cancel", style="neutral",
+                                 command=self.toggle_edit_mode).pack(side="left", padx=4)
         else:
-            s_ent = tk.Entry(ctrls, textvariable=self.search_var, font=("Arial", 10),
-                             width=25, bg="#f4f4f4", bd=0)
-            s_ent.pack(side="left", padx=5, ipady=3)
+            search_wrap = tk.Frame(ctrls, bg=C["bg_input"],
+                                   highlightthickness=1,
+                                   highlightbackground=C["border"],
+                                   highlightcolor=C["border_focus"])
+            search_wrap.pack(side="left", padx=4)
+
+            tk.Label(search_wrap, text="🔍", font=("Segoe UI Emoji", 10),
+                     bg=C["bg_input"], fg=C["text_muted"]).pack(side="left", padx=(10, 4))
+            s_ent = tk.Entry(search_wrap, textvariable=self.search_var,
+                             font=_font(10), width=24,
+                             bg=C["bg_input"], fg=C["text_primary"],
+                             insertbackground=C["text_primary"],
+                             relief="flat", bd=0)
+            s_ent.pack(side="left", ipady=7, padx=(0, 10))
             s_ent.bind("<Return>", lambda e: self.switch_section(section_type))
-            tk.Button(ctrls, text="Search", bg="#d2b48c", fg="white",
-                      command=lambda: self.switch_section(section_type)).pack(side="left", padx=2)
+
+            self._styled_button(ctrls, "Search", style="primary",
+                                 command=lambda: self.switch_section(section_type)).pack(side="left", padx=4)
             if section_type == "Students":
-                f_btn = tk.Button(ctrls, text="Filter ▽", bg="#8b4513", fg="white",
-                                  padx=12, command=lambda: self.show_filter_menu(f_btn))
-                f_btn.pack(side="left", padx=2)
+                filter_count = sum(len(v) for v in self.active_filters.values())
+                f_label = f"Sort  ▾" if filter_count == 0 else f"Sort ({filter_count})  ▾"
+                f_btn = self._styled_button(ctrls, f_label, style="neutral", command=None)
+                f_btn.config(command=lambda: self.show_filter_menu(f_btn))
+                f_btn.pack(side="left", padx=4)
+
+        card = tk.Frame(self.content_frame, bg=C["bg_card"],
+                        highlightthickness=1, highlightbackground=C["border"])
+        card.pack(fill="both", expand=True, padx=28, pady=16)
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(0, weight=1)
 
         display_cols = ["Select"] + columns if self.edit_mode else columns
-        self.tree = ttk.Treeview(self.content_frame, columns=display_cols, show="headings")
+        self.tree = ttk.Treeview(card, columns=display_cols, show="headings",
+                                 style="Modern.Treeview", selectmode="none")
 
         for col in self.tree["columns"]:
-            self.tree.heading(col, text=col)
+            self.tree.heading(col, text=col.upper(), command=lambda _col=col: self.sort_column(_col, False))
             if col == "Select":
-                self.tree.column(col, width=50, minwidth=50, anchor="center", stretch=False)
+                self.tree.column(col, width=60, minwidth=60, anchor="center", stretch=False)
+            elif col in ("ID", "Code", "Prog Code", "Coll Code"):
+                self.tree.column(col, width=110, minwidth=80, anchor="center", stretch=False)
+            elif col in ("Gender", "Year"):
+                self.tree.column(col, width=80, minwidth=70, anchor="center", stretch=False)
             else:
-                self.tree.column(col, width=100, minwidth=80, anchor="center", stretch=True)
+                self.tree.column(col, width=160, minwidth=100, anchor="w", stretch=True)
 
-        tree_scroll = ttk.Scrollbar(self.content_frame, orient="vertical", command=self.tree.yview)
+        tree_scroll = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview,
+                                     style="Modern.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=tree_scroll.set)
-        tree_scroll.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y", pady=1, padx=(0, 2))
+        self.tree.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.tree.tag_configure("odd",  background=C["bg_card"])
+        self.tree.tag_configure("even", background=C["bg_row_alt"])
+        self.tree.tag_configure("checked", background=C["accent_muted"])
 
         if rows:
-            for r in rows:
-                self.tree.insert("", "end", values=(["[ ]"] + list(r) if self.edit_mode else list(r)))
-        elif self.search_var.get().strip():
-            lbl_frame = tk.Frame(self.tree, bg="white")
-            lbl_frame.place(relx=0.5, rely=0.4, anchor="center")
-            tk.Label(lbl_frame, text="No search results found.",
-                     font=("Arial", 12, "italic"), fg="gray", bg="white").pack()
+            for idx, r in enumerate(rows):
+                tag = "odd" if idx % 2 == 0 else "even"
+                vals = ["[ ]"] + list(r) if self.edit_mode else list(r)
+                self.tree.insert("", "end", values=vals, tags=(tag,))
+        else:
+            self.tree.pack_forget()
+            tree_scroll.pack_forget()
+            empty_frame = tk.Frame(card, bg=C["bg_card"])
+            empty_frame.place(relx=0.5, rely=0.45, anchor="center")
+            tk.Label(empty_frame, text="📭", font=("Segoe UI Emoji", 32),
+                     bg=C["bg_card"], fg=C["text_muted"]).pack()
+            msg = "No search results found." if self.search_var.get().strip() else "No records yet."
+            tk.Label(empty_frame, text=msg, font=_font(12),
+                     bg=C["bg_card"], fg=C["text_muted"]).pack(pady=(8, 0))
 
         if self.edit_mode:
             self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
 
-    # ------------------------------------------------------------------
-    # Section views
-    # ------------------------------------------------------------------
-
     def show_students(self):
         rows = db_get_students(search=self.search_var.get(), filters=self.active_filters)
-        self.display_table(["ID", "Name", "Gender", "Year", "Program", "College"], rows, "Students")
+        self.display_table(["ID", "Name", "Gender", "Year", "Prog Code", "Program", "Coll Code", "College"], rows, "Students")
 
     def show_programs(self):
         rows = db_get_programs(search=self.search_var.get())
-        self.display_table(["Code", "Program Name", "College"], rows, "Programs")
+        self.display_table(["Code", "Program Name", "Coll Code", "College"], rows, "Programs")
 
     def show_colleges(self):
         rows = db_get_colleges(search=self.search_var.get())
         self.display_table(["Code", "College Name"], rows, "Colleges")
 
-    # ------------------------------------------------------------------
-    # Add popup
-    # ------------------------------------------------------------------
+    def _make_popup(self, title, width, height):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=C["bg_app"])
+        win.transient(self)
+        win.grab_set()
+        self.center_window_small(win, width, height)
+        win.resizable(False, False)
+
+        bar = tk.Frame(win, bg=C["bg_sidebar"])
+        bar.pack(fill="x")
+        tk.Label(bar, text=title, font=_font(13, "bold"),
+                 bg=C["bg_sidebar"], fg=C["text_primary"],
+                 pady=16, padx=24).pack(side="left")
+
+        container = tk.Frame(win, bg=C["bg_card"], padx=24, pady=20)
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+        return win, container
 
     def add_entry_popup(self):
         if self.add_popup_win and self.add_popup_win.winfo_exists():
             self.add_popup_win.lift()
             return
-        self.add_popup_win = tk.Toplevel(self)
         current = self.active_section.get()
-        self.add_popup_win.title(f"Add {current}")
-        self.add_popup_win.configure(bg="white")
-        self.add_popup_win.transient(self)
-        self.add_popup_win.grab_set()
-        self.center_window_small(self.add_popup_win, 400, 680)
-        container = tk.Frame(self.add_popup_win, bg="white", padx=20, pady=20)
-        container.pack(fill="both", expand=True)
+        self.add_popup_win, container = self._make_popup(f"Add {current}", 420, 700)
 
         if current == "Students":
-            tk.Label(container, text="ID Number", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            id_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            id_ent.pack(fill="x", pady=(5, 0), ipady=3)
-            err_msg = tk.Label(
-                container,
-                text="Invalid Input. ID Number must follow the\nformat YYYY-NNNN (e.g. 2024-0001)",
-                font=("Arial", 7, "italic"), fg="red", bg="white", justify="right"
-            )
-            tk.Label(container, text="First Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w", pady=(10, 0))
-            fn_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            fn_ent.pack(fill="x", pady=5, ipady=3)
-            tk.Label(container, text="Last Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            ln_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            ln_ent.pack(fill="x", pady=5, ipady=3)
+            self._field_label(container, "ID Number")
+            id_ent = self._styled_entry(container)
+            id_ent.pack(fill="x", ipady=6)
+            err_msg = tk.Label(container,
+                text="Invalid format. Use YYYY-NNNN (e.g. 2024-0001)",
+                font=_font(8, "italic"), fg=C["danger"], bg=C["bg_card"], justify="right")
+
+            self._field_label(container, "First Name")
+            fn_ent = self._styled_entry(container)
+            fn_ent.pack(fill="x", ipady=6)
+
+            self._field_label(container, "Last Name")
+            ln_ent = self._styled_entry(container)
+            ln_ent.pack(fill="x", ipady=6)
 
             prog_names = ["Not Enrolled"] + db_get_all_program_names()
             prog_sel, _ = self.create_popup_dropdown(container, "Program", prog_names)
@@ -557,7 +866,7 @@ class StudentDirectoryApp(tk.Tk):
                 err_msg.pack_forget()
                 raw_id = id_ent.get().strip()
                 if not re.match(r"^\d{4}-\d{4}$", raw_id):
-                    err_msg.pack(anchor="e")
+                    err_msg.pack(anchor="e", pady=(2, 0))
                     return
                 if db_student_id_exists(raw_id):
                     messagebox.showerror("Error", f"Student ID '{raw_id}' already exists.")
@@ -579,16 +888,21 @@ class StudentDirectoryApp(tk.Tk):
                 self.show_students()
                 self.add_popup_win.destroy()
 
-            tk.Button(container, text="SAVE", bg="#8b4513", fg="white",
-                      font=("Arial", 10, "bold"), command=save).pack(pady=20)
+            btn_row = tk.Frame(container, bg=C["bg_card"])
+            btn_row.pack(fill="x", pady=(20, 0))
+            self._styled_button(btn_row, "Save", command=save, style="primary").pack(side="right")
+            self._styled_button(btn_row, "Cancel", command=self.add_popup_win.destroy,
+                                 style="neutral").pack(side="right", padx=(0, 8))
 
         elif current == "Programs":
-            tk.Label(container, text="Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            c_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            c_ent.pack(fill="x", pady=5, ipady=3)
-            tk.Label(container, text="Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            n_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            n_ent.pack(fill="x", pady=5, ipady=3)
+            self._field_label(container, "Program Code")
+            c_ent = self._styled_entry(container)
+            c_ent.pack(fill="x", ipady=6)
+
+            self._field_label(container, "Program Name")
+            n_ent = self._styled_entry(container)
+            n_ent.pack(fill="x", ipady=6)
+
             coll_opts = ["N/A"] + db_get_all_college_options()
             coll_sel, _ = self.create_popup_dropdown(container, "College", coll_opts)
 
@@ -608,16 +922,20 @@ class StudentDirectoryApp(tk.Tk):
                 self.show_programs()
                 self.add_popup_win.destroy()
 
-            tk.Button(container, text="SAVE", bg="#8b4513", fg="white",
-                      font=("Arial", 10, "bold"), command=save_p).pack(pady=20)
+            btn_row = tk.Frame(container, bg=C["bg_card"])
+            btn_row.pack(fill="x", pady=(20, 0))
+            self._styled_button(btn_row, "Save", command=save_p, style="primary").pack(side="right")
+            self._styled_button(btn_row, "Cancel", command=self.add_popup_win.destroy,
+                                 style="neutral").pack(side="right", padx=(0, 8))
 
         elif current == "Colleges":
-            tk.Label(container, text="Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            c_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            c_ent.pack(fill="x", pady=5, ipady=3)
-            tk.Label(container, text="Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-            n_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-            n_ent.pack(fill="x", pady=5, ipady=3)
+            self._field_label(container, "College Code")
+            c_ent = self._styled_entry(container)
+            c_ent.pack(fill="x", ipady=6)
+
+            self._field_label(container, "College Name")
+            n_ent = self._styled_entry(container)
+            n_ent.pack(fill="x", ipady=6)
 
             def save_c():
                 code = c_ent.get().strip().upper()
@@ -633,12 +951,11 @@ class StudentDirectoryApp(tk.Tk):
                 self.show_colleges()
                 self.add_popup_win.destroy()
 
-            tk.Button(container, text="SAVE", bg="#8b4513", fg="white",
-                      font=("Arial", 10, "bold"), command=save_c).pack(pady=20)
-
-    # ------------------------------------------------------------------
-    # Edit student
-    # ------------------------------------------------------------------
+            btn_row = tk.Frame(container, bg=C["bg_card"])
+            btn_row.pack(fill="x", pady=(20, 0))
+            self._styled_button(btn_row, "Save", command=save_c, style="primary").pack(side="right")
+            self._styled_button(btn_row, "Cancel", command=self.add_popup_win.destroy,
+                                 style="neutral").pack(side="right", padx=(0, 8))
 
     def _get_one_selected(self, label):
         selected = [
@@ -668,31 +985,23 @@ class StudentDirectoryApp(tk.Tk):
         if self.edit_popup_win and self.edit_popup_win.winfo_exists():
             self.edit_popup_win.lift()
             return
-        self.edit_popup_win = tk.Toplevel(self)
-        self.edit_popup_win.title("Edit Student")
-        self.edit_popup_win.configure(bg="white")
-        self.edit_popup_win.transient(self)
-        self.edit_popup_win.grab_set()
-        self.center_window_small(self.edit_popup_win, 400, 720)
+        self.edit_popup_win, container = self._make_popup("Edit Student", 420, 740)
 
-        container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
-        container.pack(fill="both", expand=True)
-
-        tk.Label(container, text="ID Number", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-        id_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        id_ent.pack(fill="x", pady=(5, 0), ipady=3)
+        self._field_label(container, "ID Number")
+        id_ent = self._styled_entry(container)
+        id_ent.pack(fill="x", ipady=6)
         id_ent.insert(0, student_data["id"])
-        id_err = tk.Label(container, text="", font=("Arial", 7, "italic"), fg="red",
-                          bg="white", justify="right", wraplength=350)
+        id_err = tk.Label(container, text="", font=_font(8, "italic"),
+                          fg=C["danger"], bg=C["bg_card"], justify="right", wraplength=360)
 
-        tk.Label(container, text="First Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w", pady=(10, 0))
-        fn_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        fn_ent.pack(fill="x", pady=5, ipady=3)
+        self._field_label(container, "First Name")
+        fn_ent = self._styled_entry(container)
+        fn_ent.pack(fill="x", ipady=6)
         fn_ent.insert(0, student_data["firstname"])
 
-        tk.Label(container, text="Last Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-        ln_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        ln_ent.pack(fill="x", pady=5, ipady=3)
+        self._field_label(container, "Last Name")
+        ln_ent = self._styled_entry(container)
+        ln_ent.pack(fill="x", ipady=6)
         ln_ent.insert(0, student_data["lastname"])
 
         prog_names = ["Not Enrolled"] + db_get_all_program_names()
@@ -706,19 +1015,16 @@ class StudentDirectoryApp(tk.Tk):
         gen_sel, _  = self.create_popup_dropdown(container, "Gender", ["Male", "Female", "Other"],
                                                   default_value=student_data["gender"])
 
-        btn_frame = tk.Frame(container, bg="white")
-        btn_frame.pack(pady=20)
-
         def save_changes():
             id_err.pack_forget()
             new_id = id_ent.get().strip()
             if not re.match(r"^\d{4}-\d{4}$", new_id):
                 id_err.config(text="ID must follow YYYY-NNNN format (e.g. 2024-0001)")
-                id_err.pack(anchor="e")
+                id_err.pack(anchor="e", pady=(2, 0))
                 return
             if db_student_id_exists(new_id, exclude_sid=student_data["id"]):
                 id_err.config(text=f"Student ID '{new_id}' already exists.")
-                id_err.pack(anchor="e")
+                id_err.pack(anchor="e", pady=(2, 0))
                 return
             new_firstname = fn_ent.get().strip().title()
             new_lastname  = ln_ent.get().strip().title()
@@ -739,15 +1045,11 @@ class StudentDirectoryApp(tk.Tk):
             self.edit_popup_win.destroy()
             messagebox.showinfo("Success", "Student information updated successfully!")
 
-        tk.Button(btn_frame, text="SAVE CHANGES", bg="#8b4513", fg="white",
-                  font=("Arial", 10, "bold"), command=save_changes).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="CANCEL", bg="gray", fg="white",
-                  font=("Arial", 10, "bold"),
-                  command=self.edit_popup_win.destroy).pack(side="left", padx=5)
-
-    # ------------------------------------------------------------------
-    # Edit program
-    # ------------------------------------------------------------------
+        btn_row = tk.Frame(container, bg=C["bg_card"])
+        btn_row.pack(fill="x", pady=(20, 0))
+        self._styled_button(btn_row, "Save Changes", command=save_changes, style="primary").pack(side="right")
+        self._styled_button(btn_row, "Cancel", command=self.edit_popup_win.destroy,
+                             style="neutral").pack(side="right", padx=(0, 8))
 
     def edit_selected_program(self):
         item = self._get_one_selected("program")
@@ -767,25 +1069,18 @@ class StudentDirectoryApp(tk.Tk):
         if self.edit_popup_win and self.edit_popup_win.winfo_exists():
             self.edit_popup_win.lift()
             return
-        self.edit_popup_win = tk.Toplevel(self)
-        self.edit_popup_win.title("Edit Program")
-        self.edit_popup_win.configure(bg="white")
-        self.edit_popup_win.transient(self)
-        self.edit_popup_win.grab_set()
-        self.center_window_small(self.edit_popup_win, 400, 480)
+        self.edit_popup_win, container = self._make_popup("Edit Program", 420, 500)
 
-        container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
-        container.pack(fill="both", expand=True)
-
-        tk.Label(container, text="Program Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-        code_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        code_ent.pack(fill="x", pady=(5, 0), ipady=3)
+        self._field_label(container, "Program Code")
+        code_ent = self._styled_entry(container)
+        code_ent.pack(fill="x", ipady=6)
         code_ent.insert(0, prog_data["prog_code"])
-        code_err = tk.Label(container, text="", font=("Arial", 7, "italic"), fg="red", bg="white", justify="right")
+        code_err = tk.Label(container, text="", font=_font(8, "italic"),
+                            fg=C["danger"], bg=C["bg_card"], justify="right")
 
-        tk.Label(container, text="Program Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w", pady=(10, 0))
-        name_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        name_ent.pack(fill="x", pady=5, ipady=3)
+        self._field_label(container, "Program Name")
+        name_ent = self._styled_entry(container)
+        name_ent.pack(fill="x", ipady=6)
         name_ent.insert(0, prog_data["name"])
 
         coll_opts = ["N/A"] + db_get_all_college_options()
@@ -797,9 +1092,6 @@ class StudentDirectoryApp(tk.Tk):
                     break
         coll_sel, _ = self.create_popup_dropdown(container, "College", coll_opts, default_value=current_coll)
 
-        btn_frame = tk.Frame(container, bg="white")
-        btn_frame.pack(pady=20)
-
         def save_changes():
             code_err.pack_forget()
             new_code = code_ent.get().strip().upper()
@@ -810,7 +1102,7 @@ class StudentDirectoryApp(tk.Tk):
                 return
             if db_prog_code_exists(new_code, exclude_code=prog_data["prog_code"]):
                 code_err.config(text=f"Program code '{new_code}' already exists.")
-                code_err.pack(anchor="e")
+                code_err.pack(anchor="e", pady=(2, 0))
                 return
             new_college_code = None if coll_val == "N/A" else (coll_val.split(" - ")[0] if " - " in coll_val else None)
             db_update_program(prog_data["prog_code"], new_code, new_name, new_college_code)
@@ -819,15 +1111,11 @@ class StudentDirectoryApp(tk.Tk):
             self.edit_popup_win.destroy()
             messagebox.showinfo("Success", "Program updated successfully!")
 
-        tk.Button(btn_frame, text="SAVE CHANGES", bg="#8b4513", fg="white",
-                  font=("Arial", 10, "bold"), command=save_changes).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="CANCEL", bg="gray", fg="white",
-                  font=("Arial", 10, "bold"),
-                  command=self.edit_popup_win.destroy).pack(side="left", padx=5)
-
-    # ------------------------------------------------------------------
-    # Edit college
-    # ------------------------------------------------------------------
+        btn_row = tk.Frame(container, bg=C["bg_card"])
+        btn_row.pack(fill="x", pady=(20, 0))
+        self._styled_button(btn_row, "Save Changes", command=save_changes, style="primary").pack(side="right")
+        self._styled_button(btn_row, "Cancel", command=self.edit_popup_win.destroy,
+                             style="neutral").pack(side="right", padx=(0, 8))
 
     def edit_selected_college(self):
         item = self._get_one_selected("college")
@@ -845,29 +1133,19 @@ class StudentDirectoryApp(tk.Tk):
         if self.edit_popup_win and self.edit_popup_win.winfo_exists():
             self.edit_popup_win.lift()
             return
-        self.edit_popup_win = tk.Toplevel(self)
-        self.edit_popup_win.title("Edit College")
-        self.edit_popup_win.configure(bg="white")
-        self.edit_popup_win.transient(self)
-        self.edit_popup_win.grab_set()
-        self.center_window_small(self.edit_popup_win, 400, 320)
+        self.edit_popup_win, container = self._make_popup("Edit College", 420, 360)
 
-        container = tk.Frame(self.edit_popup_win, bg="white", padx=20, pady=20)
-        container.pack(fill="both", expand=True)
-
-        tk.Label(container, text="College Code", bg="white", font=("Arial", 8, "bold")).pack(anchor="w")
-        code_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        code_ent.pack(fill="x", pady=(5, 0), ipady=3)
+        self._field_label(container, "College Code")
+        code_ent = self._styled_entry(container)
+        code_ent.pack(fill="x", ipady=6)
         code_ent.insert(0, coll_data["college_code"])
-        code_err = tk.Label(container, text="", font=("Arial", 7, "italic"), fg="red", bg="white", justify="right")
+        code_err = tk.Label(container, text="", font=_font(8, "italic"),
+                            fg=C["danger"], bg=C["bg_card"], justify="right")
 
-        tk.Label(container, text="College Name", bg="white", font=("Arial", 8, "bold")).pack(anchor="w", pady=(10, 0))
-        name_ent = tk.Entry(container, bg="#f4f4f4", bd=0)
-        name_ent.pack(fill="x", pady=5, ipady=3)
+        self._field_label(container, "College Name")
+        name_ent = self._styled_entry(container)
+        name_ent.pack(fill="x", ipady=6)
         name_ent.insert(0, coll_data["name"])
-
-        btn_frame = tk.Frame(container, bg="white")
-        btn_frame.pack(pady=20)
 
         def save_changes():
             code_err.pack_forget()
@@ -878,7 +1156,7 @@ class StudentDirectoryApp(tk.Tk):
                 return
             if db_college_code_exists(new_code, exclude_code=coll_data["college_code"]):
                 code_err.config(text=f"College code '{new_code}' already exists.")
-                code_err.pack(anchor="e")
+                code_err.pack(anchor="e", pady=(2, 0))
                 return
             db_update_college(coll_data["college_code"], new_code, new_name)
             self._last_mtime = self._get_db_mtime()
@@ -886,15 +1164,11 @@ class StudentDirectoryApp(tk.Tk):
             self.edit_popup_win.destroy()
             messagebox.showinfo("Success", "College updated successfully!")
 
-        tk.Button(btn_frame, text="SAVE CHANGES", bg="#8b4513", fg="white",
-                  font=("Arial", 10, "bold"), command=save_changes).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="CANCEL", bg="gray", fg="white",
-                  font=("Arial", 10, "bold"),
-                  command=self.edit_popup_win.destroy).pack(side="left", padx=5)
-
-    # ------------------------------------------------------------------
-    # Filter menu
-    # ------------------------------------------------------------------
+        btn_row = tk.Frame(container, bg=C["bg_card"])
+        btn_row.pack(fill="x", pady=(20, 0))
+        self._styled_button(btn_row, "Save Changes", command=save_changes, style="primary").pack(side="right")
+        self._styled_button(btn_row, "Cancel", command=self.edit_popup_win.destroy,
+                             style="neutral").pack(side="right", padx=(0, 8))
 
     def show_filter_menu(self, widget):
         if self.filter_win and self.filter_win.winfo_exists():
@@ -905,21 +1179,26 @@ class StudentDirectoryApp(tk.Tk):
         self.filter_win = tk.Toplevel(self)
         self.filter_win.withdraw()
         self.filter_win.overrideredirect(True)
-        w_width, w_height = 330, 480
+        w_width, w_height = 340, 500
         app_x, app_y = self.winfo_rootx(), self.winfo_rooty()
         app_w, app_h = self.winfo_width(), self.winfo_height()
         start_x = widget.winfo_rootx() - 150
-        start_y = widget.winfo_rooty() + 30
+        start_y = widget.winfo_rooty() + 36
         if start_x + w_width > app_x + app_w: start_x = (app_x + app_w) - w_width - 10
         if start_x < app_x: start_x = app_x + 10
         if start_y + w_height > app_y + app_h: start_y = (app_y + app_h) - w_height - 10
         self.filter_win.geometry(f"{w_width}x{w_height}+{start_x}+{start_y}")
         self.filter_win.deiconify()
 
-        container = tk.Frame(self.filter_win, bg="white", bd=2, relief="groove")
+        container = tk.Frame(self.filter_win, bg=C["bg_card"],
+                             highlightthickness=1, highlightbackground=C["border"])
         container.pack(fill="both", expand=True)
-        tk.Label(container, text="Filters", font=("Arial", 10, "bold"),
-                 bg="#8b4513", fg="white", pady=5).pack(fill="x")
+
+        hdr = tk.Frame(container, bg=C["bg_sidebar"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Filters", font=_font(12, "bold"),
+                 bg=C["bg_sidebar"], fg=C["text_primary"],
+                 padx=16, pady=12).pack(side="left")
 
         def apply_filters():
             self.active_filters = self.pending_filters
@@ -927,16 +1206,20 @@ class StudentDirectoryApp(tk.Tk):
             self.filter_win.destroy()
             self.filter_win = None
 
-        tk.Button(container, text="APPLY FILTERS", bg="#8b4513", fg="white",
-                  font=("Arial", 9, "bold"), command=apply_filters).pack(side="bottom", pady=15)
+        bottom_bar = tk.Frame(container, bg=C["bg_sidebar"])
+        bottom_bar.pack(side="bottom", fill="x")
+        self._styled_button(bottom_bar, "Apply Filters", command=apply_filters,
+                             style="primary").pack(fill="x", padx=16, pady=12)
 
-        scroll_cont = tk.Frame(container, bg="white")
+        scroll_cont = tk.Frame(container, bg=C["bg_card"])
         scroll_cont.pack(fill="both", expand=True)
-        c_area = tk.Frame(scroll_cont, bg="white")
-        c_area.pack(fill="x", padx=5)
-        tag_canvas = tk.Canvas(scroll_cont, bg="#f9f9f9", height=0, highlightthickness=0)
-        tag_frame = tk.Frame(tag_canvas, bg="#f9f9f9")
-        cl_btn_cont = tk.Frame(scroll_cont, bg="white")
+
+        c_area = tk.Frame(scroll_cont, bg=C["bg_card"])
+        c_area.pack(fill="x", padx=12)
+
+        tag_canvas = tk.Canvas(scroll_cont, bg=C["bg_app"], height=0, highlightthickness=0)
+        tag_frame = tk.Frame(tag_canvas, bg=C["bg_app"])
+        cl_btn_cont = tk.Frame(scroll_cont, bg=C["bg_card"])
 
         def refresh_tags():
             for c in tag_frame.winfo_children():
@@ -945,11 +1228,13 @@ class StudentDirectoryApp(tk.Tk):
             for w in cl_btn_cont.winfo_children():
                 w.destroy()
             if total_tags > 0:
-                tag_canvas.pack(fill="x", padx=10, pady=5)
-                cl_btn_cont.pack(fill="x", padx=10)
+                tag_canvas.pack(fill="x", padx=12, pady=4)
+                cl_btn_cont.pack(fill="x", padx=12)
                 tk.Button(
-                    cl_btn_cont, text="Clear All ✕", bg="white", fg="#cc0000",
-                    font=("Arial", 8, "bold"), bd=0,
+                    cl_btn_cont, text="Clear All ✕",
+                    bg=C["bg_card"], fg=C["danger"],
+                    activebackground=C["bg_hover"], activeforeground=C["danger_hover"],
+                    font=_font(8, "bold"), bd=0, cursor="hand2",
                     command=lambda: [
                         self.pending_filters.update({k: [] for k in self.pending_filters}),
                         refresh_tags()
@@ -957,17 +1242,20 @@ class StudentDirectoryApp(tk.Tk):
                 ).pack(side="right")
                 for k, vs in self.pending_filters.items():
                     for v in vs:
-                        t = tk.Frame(tag_frame, bg="#d2b48c", padx=4, pady=1)
-                        t.pack(side="left", padx=2, pady=2)
-                        tk.Label(t, text=v, bg="#d2b48c", fg="white", font=("Arial", 8)).pack(side="left")
+                        t = tk.Frame(tag_frame, bg=C["accent_muted"], padx=6, pady=2)
+                        t.pack(side="left", padx=3, pady=3)
+                        tk.Label(t, text=v, bg=C["accent_muted"], fg=C["accent"],
+                                 font=_font(8, "bold")).pack(side="left")
                         tk.Button(
-                            t, text="✕", bg="#d2b48c", fg="white", bd=0,
+                            t, text="✕", bg=C["accent_muted"], fg=C["text_muted"],
+                            activebackground=C["accent_muted"], activeforeground=C["danger"],
+                            bd=0, font=_font(8), cursor="hand2",
                             command=lambda key=k, val=v: [
                                 self.pending_filters[key].remove(val), refresh_tags()
                             ]
-                        ).pack(side="left")
+                        ).pack(side="left", padx=(4, 0))
                 tag_frame.update_idletasks()
-                tag_canvas.config(height=min(tag_frame.winfo_reqheight(), 60))
+                tag_canvas.config(height=min(tag_frame.winfo_reqheight(), 64))
             else:
                 tag_canvas.pack_forget()
                 cl_btn_cont.pack_forget()
@@ -984,10 +1272,6 @@ class StudentDirectoryApp(tk.Tk):
                                    True, "college", refresh_tags)
         refresh_tags()
 
-    # ------------------------------------------------------------------
-    # Tree interaction
-    # ------------------------------------------------------------------
-
     def check_filter_focus(self, event):
         if self.filter_win and self.filter_win.winfo_exists():
             x, y = event.x_root, event.y_root
@@ -1001,8 +1285,14 @@ class StudentDirectoryApp(tk.Tk):
         item = self.tree.identify_row(event.y)
         if item:
             vals = list(self.tree.item(item, "values"))
-            vals[0] = "[X]" if vals[0] == "[ ]" else "[ ]"
-            self.tree.item(item, values=vals)
+            if vals[0] == "[ ]":
+                vals[0] = "[X]"
+                self.tree.item(item, values=vals, tags=("checked",))
+            else:
+                vals[0] = "[ ]"
+                idx = self.tree.index(item)
+                tag = "odd" if idx % 2 == 0 else "even"
+                self.tree.item(item, values=vals, tags=(tag,))
 
     def delete_selected(self, section):
         selected_keys = [
